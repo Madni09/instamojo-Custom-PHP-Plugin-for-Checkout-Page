@@ -1,0 +1,188 @@
+<?php
+/**
+ * Plugin Name: IMJ Mini
+ * Description: Minimal Instamojo payment-request endpoint for Elementor checkout (dynamic pricing, production-ready).
+ * Version: 1.0
+ */
+
+if (!defined('ABSPATH')) exit;
+
+add_action('rest_api_init', function () {
+  register_rest_route('imj-mini/v1', '/request', array(
+    'methods'  => 'POST',
+    'callback' => 'imj_mini_create_request',
+    'permission_callback' => '__return_true'
+  ));
+});
+
+/**
+ * Environment / credentials for Instamojo (LIVE only)
+ *
+ * In wp-config.php add:
+ *   define('IMJ_API_KEY',    'api key');
+ *   define('IMJ_AUTH_TOKEN', 'auth_toekn');
+ *   define('IMJ_REDIRECT_URL', 'https://website-domain.in/thank-you/');
+ */
+function imj_mini_env() {
+  $api_key    = defined('IMJ_API_KEY')    ? IMJ_API_KEY    : 'api key ';
+  $auth_token = defined('IMJ_AUTH_TOKEN') ? IMJ_AUTH_TOKEN : 'auth token ';
+
+  // Required for production
+  if (!$api_key || !$auth_token) {
+    return array(
+      'ok'    => false,
+      'error' => 'missing_keys'
+    );
+  }
+
+  // LIVE Instamojo API base URL
+  $base_url = 'https://www.instamojo.com/api/1.1';
+
+  // Thank-you redirect URL
+  $redirect_url = defined('IMJ_REDIRECT_URL')
+    ? IMJ_REDIRECT_URL
+    : home_url('/thank-you/');
+
+  return array(
+    'ok'           => true,
+    'api_key'      => $api_key,
+    'auth_token'   => $auth_token,
+    'base_url'     => $base_url,
+    'redirect_url' => $redirect_url
+  );
+}
+
+/**
+ * Create Instamojo payment request
+ *
+ * Expects JSON body like:
+ * {
+ *   "base": 51,
+ *   "extra198": 0 | 198 | ...,
+ *   "extra199": 0 | 199 | ...,
+ *   "name": "Buyer Name",
+ *   "email": "buyer@example.com",
+ *   "phone": "9876543210",
+ *   "purpose": "Career Branding Masterclass"
+ * }
+ */
+function imj_mini_create_request($req) {
+  $env = imj_mini_env();
+  if (empty($env['ok'])) {
+    return new WP_REST_Response(array(
+      'error' => 'missing_keys',
+      'msg'   => 'Define IMJ_API_KEY and IMJ_AUTH_TOKEN in wp-config.php'
+    ), 500);
+  }
+
+  $p = method_exists($req, 'get_json_params') ? $req->get_json_params() : array();
+  if (!is_array($p)) $p = array();
+
+  // ------- PRICING INPUTS (IN RUPEES) -------
+
+  // Base price (main ticket)
+  $base = isset($p['base']) ? intval($p['base']) : 0;
+  if ($base < 0) $base = 0;
+
+  // Bump 1 (extra198) – supports both boolean and numeric
+  $rawExtra198 = isset($p['extra198']) ? $p['extra198'] : 0;
+  if (is_bool($rawExtra198)) {
+    $extra198 = $rawExtra198 ? 198 : 0;
+  } else {
+    $extra198 = intval($rawExtra198);
+  }
+  if ($extra198 < 0) $extra198 = 0;
+
+  // Bump 2 (extra199) – supports both boolean and numeric
+  $rawExtra199 = isset($p['extra199']) ? $p['extra199'] : 0;
+  if (is_bool($rawExtra199)) {
+    $extra199 = $rawExtra199 ? 199 : 0;
+  } else {
+    $extra199 = intval($rawExtra199);
+  }
+  if ($extra199 < 0) $extra199 = 0;
+
+  $total_rupees = $base + $extra198 + $extra199;
+
+  if ($total_rupees <= 0) {
+    return new WP_REST_Response(array(
+      'error'   => 'invalid_amount',
+      'details' => 'Computed amount is <= 0 (base + bumps)'
+    ), 400);
+  }
+
+  // Instamojo expects string with 2 decimals, e.g. "51.00"
+  $amount_str = number_format($total_rupees, 2, '.', '');
+
+  // ------- BUYER DETAILS -------
+
+  $name  = !empty($p['name'])  ? sanitize_text_field($p['name'])  : '';
+  $email = !empty($p['email']) ? sanitize_email($p['email'])      : '';
+  $phone = !empty($p['phone']) ? preg_replace('/\D+/', '', $p['phone']) : '';
+
+  $purpose = !empty($p['purpose'])
+    ? sanitize_text_field($p['purpose'])
+    : 'Career Branding Masterclass';
+
+  // Basic server-side validation
+  if (!$name || !$email || !$phone) {
+    return new WP_REST_Response(array(
+      'error'   => 'missing_fields',
+      'details' => 'name, email, phone are required'
+    ), 400);
+  }
+
+  // ------- BUILD INSTAMOJO PAYLOAD -------
+
+  $payload = array(
+    'purpose'                 => $purpose,
+    'amount'                  => $amount_str,
+    'buyer_name'              => $name,
+    'email'                   => $email,
+    'phone'                   => $phone,
+    'send_email'              => false,
+    'send_sms'                => false,
+    'allow_repeated_payments' => false,
+    'redirect_url'            => $env['redirect_url'],
+    'webhook' => 'https://connect.pabbly.com/workflow/sendwebhookdata/IjU3NjcwNTZkMDYzNjA0M2Q1MjZmNTUzMDUxMzci_pc'
+    // Optional: add webhook endpoint here if you want server-side verification later
+    // 'webhook' => 'https://your-site.com/instamojo-webhook/'
+  );
+
+  $args = array(
+    'headers' => array(
+      'X-Api-Key'    => $env['api_key'],
+      'X-Auth-Token' => $env['auth_token'],
+      'Accept'       => 'application/json'
+    ),
+    'body'    => $payload, // form-encoded
+    'timeout' => 20
+  );
+
+  $response = wp_remote_post($env['base_url'] . '/payment-requests/', $args);
+
+  if (is_wp_error($response)) {
+    return new WP_REST_Response(array(
+      'error'   => 'http_error',
+      'details' => $response->get_error_message()
+    ), 500);
+  }
+
+  $code = wp_remote_retrieve_response_code($response);
+  $body = wp_remote_retrieve_body($response);
+
+  $data = json_decode($body, true);
+
+  // Instamojo success format:
+  // { "success": true, "payment_request": { ... } }
+  if ($code >= 200 && $code < 300 && !empty($data['success']) && !empty($data['payment_request'])) {
+    // Only return the useful payment_request part (includes longurl, id, etc.)
+    return new WP_REST_Response($data['payment_request'], 200);
+  }
+
+  return new WP_REST_Response(array(
+    'error'  => 'instamojo_error',
+    'status' => $code,
+    'body'   => $body
+  ), 500);
+}
