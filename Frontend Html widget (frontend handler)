@@ -1,0 +1,194 @@
+<script src="https://js.instamojo.com/v1/checkout.js"></script>
+
+<script>
+  // --- helpers to reliably read form fields ---
+  function valOrEmpty(el) {
+    return (el && typeof el.value === 'string') ? el.value.trim() : '';
+  }
+
+  function findBySelectors(selectors) {
+    for (const s of selectors) {
+      const el = document.querySelector(s);
+      if (el && valOrEmpty(el)) return valOrEmpty(el);
+    }
+    return '';
+  }
+
+  function findByPlaceholder(keywords, types = ['input']) {
+    const sels = types.map(t => `${t}[placeholder]`);
+    const nodes = document.querySelectorAll(sels.join(','));
+    for (const el of nodes) {
+      const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+      if (keywords.some(k => ph.includes(k)) && valOrEmpty(el)) return valOrEmpty(el);
+    }
+    return '';
+  }
+
+  function getFormData() {
+    // NAME
+    let name =
+      findBySelectors([
+        '#name', '#fullname', '#full_name', '[name="name"]', '[name*="name" i]',
+        '[name*="fullname" i]', '[name*="full_name" i]'
+      ]) || findByPlaceholder(['name']);
+
+    // EMAIL
+    let email =
+      findBySelectors([
+        'input[type="email"]', '#email', '[name="email"]', '[name*="email" i]'
+      ]) || findByPlaceholder(['email']);
+
+    // PHONE
+    let phone =
+      findBySelectors([
+        'input[type="tel"]', 'input[type="number"]', '#phone', '#mobile',
+        '[name="phone"]', '[name*="phone" i]', '[name*="mobile" i]'
+      ]) || findByPlaceholder(['phone', 'mobile', 'contact'], ['input']);
+
+    // Optional date field
+    let date =
+      findBySelectors(['#date', '[name="date"]', 'select[name*="date" i]', 'select']) ||
+      findByPlaceholder(['date'], ['input', 'select']);
+
+    // --- FIX FOR PHONE NUMBER (91 PREFIX) ---
+    phone = phone.replace(/[^\d]/g, ''); // Keep digits only
+
+    // If number is 12 digits and starts with 91, remove the 91
+    if (phone.length === 12 && phone.startsWith('91')) {
+        phone = phone.substring(2);
+    }
+    // Optional: If number is 11 digits and starts with 0, remove the 0
+    if (phone.length === 11 && phone.startsWith('0')) {
+        phone = phone.substring(1);
+    }
+    
+    return { name, email, phone, date };
+  }
+
+  // ----- DYNAMIC PRICING (IN RUPEES) -----
+  function buildPricingPayload() {
+    // BASE price
+    let base = 99;
+    const btn = document.getElementById('imj-button');
+    if (btn && btn.dataset.basePrice) {
+      const parsedBase = parseInt(btn.dataset.basePrice, 10);
+      if (!Number.isNaN(parsedBase) && parsedBase >= 0) {
+        base = parsedBase;
+      }
+    }
+
+    // BUMP #1
+    let extra198 = 0;
+    const bump1 = document.getElementById('extraOffer');
+    if (bump1 && bump1.checked) {
+      const attr = bump1.dataset.amount || '199';
+      const parsed = parseInt(attr, 10);
+      if (!Number.isNaN(parsed) && parsed > 0) {
+        extra198 = parsed;
+      }
+    }
+
+    // BUMP #2
+    let extra199 = 0;
+    const bump2 = document.getElementById('extraOffer199');
+    if (bump2 && bump2.checked) {
+      const attr = bump2.dataset.amount || '199';
+      const parsed = parseInt(attr, 10);
+      if (!Number.isNaN(parsed) && parsed > 0) {
+        extra199 = parsed;
+      }
+    }
+
+    console.log('Instamojo pricing payload (rupees):', { base, extra198, extra199 });
+    return { base, extra198, extra199 };
+  }
+
+  async function createInstamojoRequest(formData) {
+    const pricing = buildPricingPayload();
+
+    const payload = {
+      base: pricing.base,
+      extra198: pricing.extra198,
+      extra199: pricing.extra199,
+      name: formData.name,
+      email: formData.email,
+      phone: formData.phone,
+      purpose: 'Breathing reset Method -Webinar'
+    };
+
+    const res = await fetch('/wp-json/imj-mini/v1/request', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      console.error('Instamojo request failed:', text);
+      throw new Error('Failed to create payment request');
+    }
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      console.error('Failed to parse Instamojo response JSON:', text);
+      throw e;
+    }
+
+    if (!data.longurl) {
+      console.error('Instamojo response missing longurl:', data);
+      throw new Error('No payment URL returned from Instamojo');
+    }
+
+    return data;
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    const btn = document.getElementById('imj-button');
+    if (!btn) return;
+
+    btn.addEventListener('click', async function (e) {
+      e.preventDefault();
+
+      const f = getFormData();
+
+      const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(f.email);
+      const phoneOk = /^[6-9]\d{9}$/.test(f.phone); // India mobile (10 digits)
+
+      if (!f.name || !emailOk || !phoneOk) {
+        alert('Please enter Name, a valid Email, and a valid 10-digit Phone.');
+        console.log('DEBUG form values:', f);
+        return;
+      }
+
+      // --- FIX: BUTTON PROCESSING STATE ---
+      const originalText = btn.innerText;
+      btn.innerText = 'Processing Payment...';
+      btn.disabled = true; // Prevent double clicks
+      // ------------------------------------
+
+      try {
+        const pr = await createInstamojoRequest(f);
+
+        if (typeof Instamojo !== 'undefined' && typeof Instamojo.open === 'function') {
+          Instamojo.open(pr.longurl);
+          // Optional: Reset button after lightbox opens just in case they cancel
+          setTimeout(() => {
+             btn.innerText = originalText;
+             btn.disabled = false;
+          }, 3000); 
+        } else {
+          window.location.href = pr.longurl;
+        }
+      } catch (err) {
+        console.error(err);
+        alert('Could not start Instamojo payment. Please try again.');
+        
+        // Revert button if error occurs
+        btn.innerText = originalText;
+        btn.disabled = false;
+      }
+    });
+  });
+</script>
